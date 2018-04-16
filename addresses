@@ -1,0 +1,647 @@
+#!/usr/bin/python3
+
+from xml.sax.saxutils import escape
+from functools import cmp_to_key
+import pprint, re, csv, requests, urllib.request, io, pickle
+from lxml import html
+from zipfile import ZipFile
+from tkinter import Listbox, StringVar, Tk, Text
+from tkinter.ttk import Button, Entry, Frame, Label, Scrollbar, Separator
+import os.path
+
+def get_cur_dir():
+  return os.path.dirname(os.path.realpath(__file__))
+
+class OpenAddressesData:
+
+  # Data consists of
+  #   id      [string]
+  #   name    [string]
+  #   entries [list of dict]
+  #    - lat      [? string]
+  #    - lon      [? string]
+  #    - unit     [? string]
+  #    - number   [? int]
+  #    - street   [? string]
+  #    - postcode [? int]
+  #    - region   [? string]
+  #    - city     [? string]
+  #    - district [? string]
+  def __init__(self, data, parent=None):
+    self.data = data
+    self.parent = parent
+
+  def length(self):
+    return len(self.data['addresses'])
+
+  def get_highest_parent(self):
+    if self.parent:
+      return self.parent.get_highest_parent()
+    return self
+
+  def save(self, filename=None):
+    data = self.data
+    if filename is None:
+      filename = self.get_id() + '.dat'
+    with open(filename, 'wb') as f:
+      pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+
+  def filter_postcode(self, postcode):
+    return self.filter_simple_by('postcode', postcode)
+
+  def filter_street(self, street):
+    return self.filter_simple_by('street', street)
+
+  def filter_simple_by(self, field, value):
+    addresses = self.data['addresses']
+    addresses_new = []
+    for address in addresses:
+      if address[field] == value:
+        addresses_new.append(address)
+    data_new = {
+      'id':        self.get_id(),
+      'name':      self.get_name(),
+      'source': self.data['source'],
+      'addresses': addresses_new,
+    }
+    return OpenAddressesData(data_new, parent=self)
+
+  def filter_eval(self, filter_expression):
+    addresses = self.data['addresses']
+    addresses_new = []
+    filter_expression_compiled = compile(filter_expression, '', 'eval')
+    for addr in addresses:
+      if eval(filter_expression_compiled, addr):
+        addresses_new.append(addr)
+    data_new = {
+      'id':        self.get_id(),
+      'name':      self.get_name(),
+      'source': self.data['source'],
+      'addresses': addresses_new,
+    }
+    return OpenAddressesData(data_new, parent=self)
+
+  def get_list_of(self, field):
+    arr = []
+    for addr in self.data['addresses']:
+      arr.append(addr[field])
+    return sorted(set(arr))
+
+  @staticmethod
+  def load(filename):
+    newfilename = filename
+    if not os.path.isfile(newfilename):
+
+      newfilename = filename + '.dat'
+      if not os.path.isfile(newfilename):
+
+        newfilename = filename.replace('/', '.')
+        if not os.path.isfile(newfilename):
+
+          newfilename += '.dat'
+          if not os.path.isfile(newfilename):
+            return None
+
+    with open(newfilename, 'rb') as f:
+      data = pickle.load(f)
+      return OpenAddressesData(data)
+
+  def get_id(self):
+    return self.data['id']
+
+  def get_name(self):
+    return self.data['name']
+
+  def compile_to_osm(self):
+    data = self.data
+
+    # The top of the OSM data file. Upload is discouraged, as this is an automated operation.
+    osmdata = '<osm version="0.6" upload="false">'
+    id = 0
+
+    extra_tags = {}
+
+    country = None
+    state = None
+    county = None # US Only
+
+    source_components = data['source'].split('/')
+    country = source_components[0]
+    if country == 'us' and len(source_components) > 1:
+      state = source_components[1]
+      state_fixed = state.upper()
+      county = None
+      if len(source_components) > 2:
+        county = source_components[2]
+        county_fixed = county.title()
+        extra_tags['addr:county'] = county_fixed
+      extra_tags['addr:state'] = state_fixed
+      extra_tags['addr:country'] = 'US'
+
+    addresses = data['addresses']
+
+    for address in addresses:
+      region   = address['region']
+      district = address['district']
+      city     = address['city']
+      postcode = str(address['postcode'])
+      street   = address['street']
+      number   = str(address['number'])
+      lat      = address['lat']
+      lon      = address['lon']
+
+      id = id - 1
+      node = '<node id="' + str(id) + '" lat="' + escape(lat) + '" lon="' + escape(lon) + '">\n'
+      node += '  <tag k="addr:housenumber" v="' + number + '" />\n'
+      node += '  <tag k="addr:street"      v="' + escape(street) + '" />\n'
+      if postcode is not '':
+        node += '  <tag k="addr:postcode"  v="' + escape(postcode) + '" />\n'
+      if city is not '':
+        node += '  <tag k="addr:city"      v="' + escape(address['city']) + '" />\n'
+      if district is not '':
+        node += '  <tag k="addr:district"  v="' + escape(address['district']) + '" />\n'
+      #if region is not '':
+      #  node += '  <tag k="addr:region"    v="' + escape(address['region']) + '" />\n'
+      node += '  <tag k="source" v="OpenAddresses.io" />\n'
+      for extra_tag in extra_tags:
+        value = extra_tags[extra_tag]
+        if value is None:
+          node += '  <tag k="' + extra_tag + '" v="*" />';
+        else:
+          node += '  <tag k="' + extra_tag + '" v="' + value + '" />';
+      node += '</node>\n'
+
+      osmdata += node
+
+    osmdata += '</osm>'
+    return osmdata
+
+
+STREET_SUFFIXES = [
+  ['Rd', 'Road'],
+  ['Dr', 'Drive'],
+  ['St', 'Street'],
+  ['Ln', 'Lane'],
+  ['Ter', 'Terrace'],
+  ['Cir', 'Circle'],
+  ['Ave', 'Avenue'],
+  ['Ct', 'Court'],
+  ['Pl', 'Place'],
+  ['Aly', 'Alley'],
+]
+
+STREET_PREFIXES = [
+  ['W', 'West'],
+  ['E', 'East'],
+  ['N', 'North'],
+  ['S', 'South'],
+  ['NW', 'Northwest'],
+  ['NE', 'Northeast'],
+  ['SW', 'Southwest'],
+  ['SE', 'Southeast'],
+]
+
+ORDINAL_SUFFIXES = ('ST', 'ND', 'RD', 'TH')
+
+def format_street(street):
+  street = street.strip()
+
+  street_components = street.split()
+
+  length = len(street_components)
+  if length == 0:
+    return ''
+  if length == 1:
+    return street.title()
+
+  # Title if the component doesn't contain a number.
+  street_components_new = []
+  for component in street_components:
+    if any(char.isdigit() for char in component):
+      street_components_new.append(component)
+      continue
+    street_components_new.append(component.title())
+  street_components = street_components_new
+
+  for i in range(0, length):
+    component = street_components[i]
+    for abbreviation, full in STREET_SUFFIXES:
+      if component == abbreviation:
+        street_components[i] = full
+        break
+    for abbreviation, full in STREET_PREFIXES:
+      if component == abbreviation:
+        street_components[i] = full
+        break
+    if len(component) > 2:
+      last_two = component[-2:]
+      if last_two in ORDINAL_SUFFIXES:
+        number = component[0:-2]
+        street_components[i] = number + last_two.lower()
+
+  return ' '.join(street_components)
+
+
+def download_openaddresses_data(source, version=1):
+  url = "http://results.openaddresses.io/sources/" + source
+  r = requests.get(url)
+  tree = html.fromstring(r.content)
+  zipped_data_url = tree.xpath('(//table[@id="source"]//td[@class="processed"]//a)[1]/@href')[0]
+
+  zipfilename = urllib.request.urlretrieve(zipped_data_url)[0]
+  zip = ZipFile(zipfilename, 'r')
+  filename = source + '.csv'
+  datafile = zip.open(filename)
+  f = io.TextIOWrapper(datafile)
+
+  name = source.title().replace('/', ' > ') + ', rev. ' + str(version)
+  id = source.replace('/', '.') + '-' + str(version)
+
+  data = csv.DictReader(f)
+  addresses = []
+
+  for address in data:
+    # Latitude
+    lon = address['LON']
+    if lon is '':
+      continue
+
+    # Longitude
+    lat = address['LAT']
+
+    # House Number
+    number = address['NUMBER']
+    if number is '' or number is '0':
+      continue
+    number = int(number)
+
+    # Street
+    street = address['STREET']
+
+    # Unit
+    unit = address['UNIT']
+
+    # City
+    city = address['CITY']
+
+    # District
+    district = address['DISTRICT']
+
+    # Region
+    region = address['REGION']
+
+    # Postcode
+    postcode_text = address['POSTCODE']
+    postcode = 0
+    if postcode_text is not '':
+      postcode = int(postcode_text)
+
+    # Formats the street to fit in better with OSM.
+    street_fixed = format_street(street)
+
+    addresses.append({
+      'region': region,
+      'district': district,
+      'city': city,
+      'postcode': postcode,
+      'street': street_fixed,
+      'number': number,
+      'unit': unit,
+      'lat': lat,
+      'lon': lon,
+    })
+
+  addresses = sorted(addresses, key=lambda address: (
+    address['region'],
+    address['district'],
+    address['city'],
+    address['postcode'],
+    address['street'],
+    address['number'],
+    address['unit'],
+    address['lat'],
+    address['lon'],
+  ))
+
+  retval = {
+    'name': name,
+    'id': id,
+    'source': source,
+    'addresses': addresses,
+  }
+  return OpenAddressesData(retval)
+
+class ScrollableListboxWithTitle(Frame):
+  def __init__(self, title, *args, **kwargs):
+    Frame.__init__(self, *args, **kwargs)
+
+    self.on_select = None
+    self.on_double = None
+
+    Label(self, text=title).pack()
+
+    self.listbox = Listbox(self)
+    self.listbox.pack(side='left', fill='both', expand=1)
+    self.__add_listbox_scrollbar(self.listbox)
+    self.listbox.bind('<Double-Button-1>', self.__on_double)
+    self.listbox.bind('<<ListboxSelect>>', self.__on_select)
+
+  def fill(self, items):
+    self.listbox.delete(0, 'end')
+    for item in items:
+      self.listbox.insert('end', item)
+
+  def __on_select(self, event):
+    if self.on_select:
+      selection = self.listbox.curselection()
+      if selection == ():
+        self.on_select(None, None)
+      else:
+        index = selection[0]
+        text = self.listbox.get(index)
+        self.on_select(index, text)
+
+  def __on_double(self, event):
+    print('double')
+    if self.on_double:
+      selection = self.listbox.curselection()
+      if selection == ():
+        self.on_double(None, None)
+      else:
+        index = selection[0]
+        text = self.listbox.get(index)
+        self.on_double(index, text)
+
+  @staticmethod
+  def __add_listbox_scrollbar(listbox):
+    scrollbar = Scrollbar(listbox.master, orient='vertical')
+    listbox.config(yscrollcommand=scrollbar.set)
+    scrollbar.config(command=listbox.yview)
+    scrollbar.pack(side='right', fill='y')
+    return listbox
+
+
+class DataRetrievalFrame(Frame):
+  def __init__(self, *args, **kwargs):
+    Frame.__init__(self, *args, **kwargs)
+
+
+    data_source_label = Label(self, text="Data Source")
+    data_source_label.pack()
+
+    self.data_source = StringVar()
+    self.data_source.set('us/pa/york')
+    data_source_entry = Entry(self, textvariable=self.data_source)
+    data_source_entry.pack()
+
+    retrieve_button = Button(self, text="Retrieve addresses", command=self.on_retrieve)
+    retrieve_button.pack()
+
+  def on_retrieve(self):
+    source = self.data_source.get().strip()
+
+    # Download & Parse
+
+    self.parent.set_message("Please wait, this may take a while...")
+    cur_dir = get_cur_dir()
+    cached_dir = os.path.join(cur_dir, 'cache')
+    if not os.path.exists(cached_dir):
+      os.makedirs(cached_dir)
+    cached_file = os.path.join(cached_dir, source.replace('/', '.'))
+    if os.path.exists(cached_file):
+      openaddresses = OpenAddressesData.load(cached_file)
+    else:
+      openaddresses = download_openaddresses_data(source)
+      openaddresses.save(cached_file)
+    self.parent.set_message("Finished!")
+    self.parent.goto_data_management(openaddresses)
+
+
+class DataManagementFrame(Frame):
+
+  class SaveFrame(Frame):
+    def __init__(self, parent, *args, **kwargs):
+      Frame.__init__(self, *args, **kwargs)
+      self.parent = parent
+
+      save_button = Button(self, text="Save addresses", command=self.on_save)
+      save_button.pack()
+
+    def on_save(self):
+
+      openaddresses = self.parent.openaddresses
+
+      # Compile
+
+      self.parent.parent.set_message("Compiling addresses...")
+      data = openaddresses.compile_to_osm()
+ 
+      # Write
+
+      cur_dir = get_cur_dir()
+
+      self.parent.parent.add_message("Writing file to disk...")
+      f2 = open(os.path.join(cur_dir, openaddresses.get_id() + '.osm'), 'w')
+      f2.write(data)
+      f2.close()
+
+      self.parent.parent.add_message("Completed!")
+
+
+  def __init__(self, openaddresses, *args, **kwargs):
+    Frame.__init__(self, *args, **kwargs)
+    self.openaddresses = openaddresses
+
+    Label(self, text="Data Source [%s]" % (openaddresses.get_name(),)).pack()
+
+
+    Separator(self).pack(side='top', expand=1, fill='x', pady=(16, 5))
+
+
+    filter_frame = Frame(self)
+    filter_frame.pack(side='top', expand=1, fill='x')
+
+    filter_label = Label(filter_frame, text="Filter\n(optional)")
+    filter_label.pack(side='left')
+
+    self.filter = StringVar()
+    filter_entry = Entry(filter_frame, textvariable=self.filter)
+    filter_entry.pack(fill='x', expand=1, side='left')
+    def filter_return(evt):
+      self.on_apply_filter()
+    filter_entry.bind('<Return>', filter_return)
+
+    filter_button = Button(filter_frame, text="Apply Filter to Dataset", command=self.on_apply_filter)
+    filter_button.pack(side='right')
+
+    clear_filter = Button(self, text='Clear', command=self.on_clear_filter)
+    clear_filter.pack(side='top')
+
+    Separator(self).pack(side='top', expand=1, fill='x', pady=(5, 16))
+
+
+    save_frame = DataManagementFrame.SaveFrame(self, self)
+    save_frame.pack(side='left', fill='both', expand=1)
+
+    def on_select_postcode(index, postcode):
+      if index is None:
+        return
+      print('Selected postcode: ' + str(postcode))
+      data_postcode = self.openaddresses.filter_postcode(postcode)
+      streets = data_postcode.get_list_of('street')
+      num_of_streets = len(streets)
+      self.update_description('Selected postcode\n' +\
+        'Double click on the postal code to filter the dataset.\n' + \
+        '# of streets: %d' % num_of_streets)
+
+    def on_select_street(index, street):
+      if index is None:
+        return
+      print('Selected street: ' + street)
+      self.update_description('Selected postcode\nDouble click on the postal code to filter the dataset.')
+
+    def on_double_postcode(index, postcode):
+      if index is None:
+        return # is this possible?
+      print('Double-clicked postcode: ' + str(postcode))
+      self.filter.set('postcode == ' + str(postcode))
+      self.on_apply_filter()
+      self.update_description('')
+
+    def on_double_street(index, street):
+      if index is None:
+        return # is this possible?
+      print('Double-clicked street: ' + street)
+      self.filter.set('street == "%s"' % street)
+      self.on_apply_filter()
+      self.update_description('')
+
+    postcode_list = ScrollableListboxWithTitle('Postcode', self)
+    postcode_list.on_select = on_select_postcode
+    postcode_list.on_double = on_double_postcode
+    postcode_list.pack(side='left', fill='both', expand=1)
+    self.postcode_list = postcode_list
+
+
+    street_list = ScrollableListboxWithTitle('Street', self)
+    street_list.on_select = on_select_street
+    street_list.on_double = on_double_street
+    street_list.pack(side='left', fill='both', expand=1)
+    self.street_list = street_list
+
+
+    self.description_var = StringVar()
+    description_entry = Label(self, textvariable=self.description_var)
+    description_entry.pack(side='left', fill='both', expand=1)
+
+    self.fill_lists()
+
+  def update_description(self, description):
+    self.description_var.set(description)
+
+  def on_clear_filter(self):
+    self.filter.set('')
+    self.on_apply_filter()
+
+  def on_apply_filter(self):
+    filter = self.filter.get().strip()
+
+    # Filter
+
+    if filter is not "":
+      self.openaddresses = self.openaddresses.get_highest_parent()
+      self.openaddresses = self.openaddresses.filter_eval(filter)
+    else:
+      self.openaddresses = self.openaddresses.get_highest_parent()
+
+    self.fill_lists()
+
+    self.parent.set_message('Filtered data! Returned ' + str(self.openaddresses.length()) + ' address(es)')
+
+  def fill_lists(self):
+    print(1)
+    postcodes = self.openaddresses.get_list_of('postcode')
+    print(2)
+    streets   = self.openaddresses.get_list_of('street')
+    print(3)
+
+    self.postcode_list.fill(postcodes)
+    print(4)
+    self.street_list.fill(streets)
+
+class MainFrame(Frame):
+
+  def __init__(self, *args, **kwargs):
+    Frame.__init__(self, *args, **kwargs)
+
+    self.child_frame = DataRetrievalFrame(self)
+    self.child_frame.parent = self
+    self.child_frame.pack(expand=1, fill='both')
+
+    self.messages = StringVar()
+    self.messages_label = Label(self, textvariable=self.messages)
+    self.messages_label.pack(fill='x', side='bottom', pady=(20, 5))
+
+    self.pack(expand=1, fill='both')
+
+  def goto_data_retrieval(self):
+    self.child_frame.destroy()
+    self.child_frame = DataRetrievalFrame(self)
+    self.child_frame.parent = self
+    self.child_frame.pack(expand=1, fill='both')
+    #self.messages_label.grid(column=0, row=1)
+
+  def goto_data_management(self, data):
+    self.child_frame.destroy()
+    self.child_frame = DataManagementFrame(data, self)
+    self.child_frame.parent = self
+    self.child_frame.pack(expand=1, fill='both')
+    #self.messages_label.grid(column=0, row=1)
+
+  def add_message(self, message):
+    if self.messages.get() is not "":
+      message = "\n" + message
+    self.messages.set(self.messages.get() + message)
+    self.update()
+
+  def set_message(self, message):
+    self.messages.set(message)
+    self.update()
+
+root = Tk()
+main = MainFrame(root)
+
+def quit_and_show_exception(e):
+  main.destroy()
+  #dialogroot = Tk(root)
+
+  dialog = Frame(root)
+  Label(dialog, text='There was a problem', font=('Arial', 20)).pack(side='top', fill='x', expand=1)
+  Label(dialog, text='If this problem is new, please create an issue on github at github.com/kaylathedev/osm-address-manager').pack(side='top', fill='x', expand=1, pady=(8, 15))
+  Label(dialog, text='Details', font=('Arial', 14)).pack(side='top', fill='x', expand=1)
+  error_details = StringVar()
+  error_details.set(e)
+  message = StringVar()
+
+  def copy_error():
+    root.clipboard_clear()
+    error_details_string = error_details.get()
+    root.clipboard_append(error_details_string)
+
+    test_string = root.clipboard_get()
+    if error_details_string == test_string:
+      # Show notification
+      message.set('Copied text to clipboard')
+    else:
+      message.set('Unable to copy!')
+
+  Entry(dialog, textvariable=error_details, state='readonly').pack(side='top', fill='x', expand=1)
+  Button(dialog, command=copy_error, text='Copy Details').pack()
+  Label(dialog, textvariable=message).pack(side='top', fill='x', expand=1)
+  dialog.pack()
+  dialog.mainloop()
+
+try:
+  root.mainloop()
+except BaseException as e:
+  quit_and_show_exception(e)
